@@ -1,4 +1,7 @@
 # common code for Blazor site database backup & load scripts
+
+#region class definitions
+
 class UpdatePathInfo {
     [string]$ProjectRelativePath
     [string]$RemoteRootRelativePath
@@ -9,11 +12,26 @@ class UpdatePathInfo {
     }
 }
 
+class ApacheInfo {
+    [string]$ConfigFile
+    [string]$MaintenanceFile
+    [string]$OnlineFile
+
+    ApacheInfo([pscustomobject]$o){
+        $this.ConfigFile = $o.ConfigFile
+        $this.MaintenanceFile = $o.MaintenanceFile
+        $this.OnlineFile = $o.OnlineFile
+    }
+}
+
 class SiteInfo{
     [string]$Name
     [string]$ProjectPath
     [string]$DatabaseStub
+    [string]$IdentityTable
+    [string]$ServiceName
     [string]$RemoteSiteDirectory
+    [ApacheInfo]$Apache
     [UpdatePathInfo[]]$DirectoriesToUpdate
     [UpdatePathInfo[]]$FilesToUpdate
 
@@ -21,20 +39,25 @@ class SiteInfo{
         $this.Name = $o.Name
         $this.ProjectPath = $o.ProjectPath
         $this.DatabaseStub = $o.DatabaseStub
+        $this.IdentityTable = $o.IdentityTable
+        $this.ServiceName = $o.ServiceName
         $this.RemoteSiteDirectory = $o.RemoteSiteDirectory
         $this.DirectoriesToUpdate = $o.DirectoriesToUpdate | ForEach-Object { [UpdatePathInfo]::new($_) }
         $this.FilesToUpdate = $o.FilesToUpdate | ForEach-Object { [UpdatePathInfo]::new($_) }
+        $this.Apache = [ApacheInfo]::new($o.Apache)
     }
 }
 
 class BlazorSitesInfo {
     [string]$HostName
     [int]$HostPort
+    [string]$ApacheSiteDirectory
     [SiteInfo[]]$SitesInfo
 
     BlazorSitesInfo([pscustomobject]$o){
         $this.HostName = $o.HostName
         $this.HostPort = $o.HostPort
+        $this.ApacheSiteDirectory = $o.ApacheSiteDirectory
         $this.SitesInfo = $o.Projects | ForEach-Object { [SiteInfo]::new($_) }
     }
 }
@@ -43,14 +66,6 @@ class ModuleConfig{
     static [BlazorSitesInfo]$BlazorSitesInfo
     static [string[]]$DbSources = @('Development', 'Website')
 }
-
-$configPath = Join-Path $HOME 'Scripts/BlazorSites.json'
-
-if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
-    throw "Configuration file not found: $configPath"
-}
-
-[ModuleConfig]::BlazorSitesInfo = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
 
 class TableInfo {
     [string]$Name
@@ -61,6 +76,22 @@ class TableInfo {
         $this.Columns = $columns
     }
 }
+
+#endregion
+
+#region module initialization code
+
+$configPath = Join-Path $HOME 'Scripts/BlazorSites.json'
+
+if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
+    throw "Configuration file not found: $configPath"
+}
+
+[ModuleConfig]::BlazorSitesInfo = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+
+#endregion
+
+#region private helper functions (not exported)
 
 function Convert-ToQuotedPath([string]$Path) {
     "'" + $Path.Replace("'", "'\''") + "'"
@@ -82,6 +113,95 @@ function Convert-SqlStringLiteral([string]$value) {
     return "'" + $value.Replace("'", "''") + "'"
 }
 
+function GetTableInfo( [object]$siteMgr ) {
+    if( $null -eq $siteMgr.ProjectName ){
+        throw "ProjectName is not defined or empty"
+    }
+
+    $site = [ModuleConfig]::BlazorSitesInfo.SitesInfo | Where-Object { $_.Name -eq $siteMgr.ProjectName }
+    if( $null -eq $site ){
+        throw "Unknown project: $(siteMgr.ProjectName)"
+    }
+
+    $tableInfoPath = Join-Path $site.ProjectPath 'TableDetails.json'
+
+    if (-not (Test-Path -LiteralPath $tableInfoPath -PathType Leaf)) {
+        throw "Table Info file not found: $tableInfoPath"
+    }
+
+    $json = Get-Content -LiteralPath $tableInfoPath -Raw | ConvertFrom-Json
+
+    return @(
+        foreach ($entry in $json) {
+            [TableInfo]::new($entry.Name, [string[]]$entry.Columns)
+        })
+}
+
+function SetProjectPath([object] $siteMgr, [string] $name ) {
+    if( [string]::IsNullOrEmpty($name) ){
+        throw 'Undefined project name!'
+    }
+
+    $site = [ModuleConfig]::BlazorSitesInfo.SitesInfo | Where-Object { $_.Name -eq $name }
+    if( $null -eq $site ){
+        throw "Unknown project: $name"
+    }
+
+    $siteMgr.ProjectPath = $site.ProjectPath
+    $siteMgr.ProjectName = $name
+}
+
+function SetDbPath( [object]$siteMgr, [string]$dbSrc ){
+    if( [string]::IsNullOrEmpty($siteMgr.ProjectPath) ){
+        throw 'Undefined project path!'
+    }
+
+    $site = [ModuleConfig]::BlazorSitesInfo.SitesInfo | Where-Object { $_.Name -eq $siteMgr.ProjectName }
+    if( $null -eq $site ){
+        throw "Unknown project: $($siteMgr.ProjectName)"
+    }
+
+    $dbStub = $site.DatabaseStub
+
+    switch( $dbSrc ){
+        'Development' { $siteMgr.DatabasePath = Join-Path $siteMgr.ProjectPath "${dbStub}.db" }
+        'Website' { $siteMgr.DatabasePath = Join-Path $siteMgr.ExeDir "${dbStub}-site.db" }
+        
+        default { throw "Invalid database source: $dbSrc" }
+    }
+
+    $siteMgr.DatabaseSource = $dbSrc
+}
+
+function SetCsvPath( [object]$siteMgr, [string]$dir ) {
+    if([string]::IsNullOrEmpty($dir)){
+        $tempDir = $null
+
+        if( [string]::IsNullOrEmpty($siteMgr.DatabaseSource)){
+            throw 'Cannot determine Csv path because DatabaseSource is undefined or empty'
+        }
+
+        switch( $siteMgr.DatabaseSource ){
+            'Development' { $tempDir = 'fromdev' }
+            'Website' { $tempDir = 'fromsite' }
+            default { throw "Invalid database source: $($siteMgr.DatabaseSource)" }
+        }
+    }
+    else {
+        $tempDir = $dir
+    }
+
+    $siteMgr.CsvPath = Resolve-PathText($tempDir)
+
+    New-Item -Path $siteMgr.CsvPath -ItemType Directory -Force
+
+    if (-not (Test-Path -LiteralPath $siteMgr.CsvPath -PathType Container)) {
+        throw "Csv directory not found: $($siteMgr.CsvPath)"
+    }
+}
+
+#endregion
+
 class BlazorSiteManagement {
     [string]$ProjectName = $null
     [string]$ProjectPath = $null
@@ -89,6 +209,8 @@ class BlazorSiteManagement {
     [string]$DatabasePath = $null
     [string]$CsvPath = $null
     [string]$ExeDir = $null
+    [PSCustomObject]$SshSession = $null
+    [PSCustomObject]$SftpSession = $null
 
     BlazorSiteManagement( 
         [string]$projName, 
@@ -96,97 +218,10 @@ class BlazorSiteManagement {
         [string]$csvDir = $null)
         {
             $this.ExeDir = [IO.Path]::GetFullPath((Get-Location).Path)
-            $this.SetProjectPath($projName)
-            $this.SetDbPath($dbSource)
-            $this.SetCsvPath($csvDir)
+            SetProjectPath $this $projName
+            SetDbPath $this $dbSource
+            SetCsvPath $this $csvDir
         }
-
-    [void] SetProjectPath( [string] $name ){
-        if( [string]::IsNullOrEmpty($name) ){
-            throw 'Undefined project name!'
-        }
-
-        $site = [ModuleConfig]::BlazorSitesInfo.SitesInfo | Where-Object { $_.Name -eq $name }
-        if( $null -eq $site ){
-            throw "Unknown project: $name"
-        }
-
-        $this.ProjectPath = $site.ProjectPath
-        $this.ProjectName = $name
-    }
-
-    [void] SetDbPath( [string]$dbSrc ){
-        if( [string]::IsNullOrEmpty($this.ProjectPath) ){
-            throw 'Undefined project path!'
-        }
-
-        $site = [ModuleConfig]::BlazorSitesInfo.SitesInfo | Where-Object { $_.Name -eq $this.ProjectName }
-        if( $null -eq $site ){
-            throw "Unknown project: $(this.ProjectName)"
-        }
-
-        $dbStub = $site.DatabaseStub
-
-        switch( $dbSrc ){
-            'Development' { $this.DatabasePath = Join-Path $this.ProjectPath "${dbStub}.db" }
-            'Website' { $this.DatabasePath = Join-Path $this.ExeDir "${dbStub}-site.db" }
-            
-            default { throw "Invalid database source: $dbSrc" }
-        }
-
-        $this.DatabaseSource = $dbSrc
-    }
-
-    [void] SetCsvPath([string]$dir){
-        if([string]::IsNullOrEmpty($dir)){
-            $tempDir = $null
-
-            if( [string]::IsNullOrEmpty($this.DatabaseSource)){
-                throw 'Cannot determine Csv path because DatabaseSource is undefined or empty'
-            }
-
-            switch( $this.DatabaseSource ){
-                'Development' { $tempDir = 'fromdev' }
-                'Website' { $tempDir = 'fromsite' }
-                default { throw "Invalid database source: $(this.DatabaseSource)" }
-            }
-        }
-        else {
-            $tempDir = $dir
-        }
-
-        $this.CsvPath = Resolve-PathText($tempDir)
-
-        New-Item -Path $this.CsvPath -ItemType Directory -Force
-
-        if (-not (Test-Path -LiteralPath $this.CsvPath -PathType Container)) {
-            throw "Csv directory not found: $($this.CsvPath)"
-        }
-    }
-
-    [TableInfo[]] GetTableInfo(){
-        if( $null -eq $this.ProjectName ){
-            throw "ProjectName is not defined or empty"
-        }
-
-        $site = [ModuleConfig]::BlazorSitesInfo.SitesInfo | Where-Object { $_.Name -eq $this.ProjectName }
-        if( $null -eq $site ){
-            throw "Unknown project: $(this.ProjectName)"
-        }
-
-        $tableInfoPath = Join-Path $site.ProjectPath 'TableDetails.json'
-
-        if (-not (Test-Path -LiteralPath $tableInfoPath -PathType Leaf)) {
-            throw "Table Info file not found: $tableInfoPath"
-        }
-
-        $json = Get-Content -LiteralPath $tableInfoPath -Raw | ConvertFrom-Json
-
-        return @(
-            foreach ($entry in $json) {
-                [TableInfo]::new($entry.Name, [string[]]$entry.Columns)
-            })
-    }
 
     [bool] GrabSiteDatabase() {
         if( $null -eq $this.ProjectName ){
@@ -203,10 +238,10 @@ class BlazorSiteManagement {
         $remotePath = "$($site.RemoteSiteDirectory)/${dbStub}.db"
         $localPath = Join-Path $this.ExeDir "${dbStub}-site.db"
 
-        # scp -i "$env:USERPROFILE\.ssh\id_ed25519" -P 11921 "mark@hwsrv-1339591.hostwindsdns.com:$remotePath" $localPath
         $remoteHost = [ModuleConfig]::BlazorSitesInfo.HostName
 
-        scp -i "$env:USERPROFILE\.ssh\id_ed25519" -P ([ModuleConfig]::BlazorSitesInfo.HostPort) "mark@${remoteHost}:${remotePath}" $localPath
+        scp -i "$env:USERPROFILE\.ssh\id_ed25519" -P ([ModuleConfig]::BlazorSitesInfo.HostPort) `
+            "mark@${remoteHost}:${remotePath}" $localPath
 
         if( $LASTEXITCODE -eq 0 ){
             return $true
@@ -232,7 +267,7 @@ class BlazorSiteManagement {
 
         $sqlite = (Get-Command sqlite3.exe -ErrorAction Stop).Source
 
-        $tableInfo = $this.GetTableInfo()
+        $tableInfo = GetTableInfo( $this )
 
         New-Item -ItemType Directory -Path $this.CsvPath -Force
 
@@ -255,11 +290,15 @@ class BlazorSiteManagement {
                 continue;
             }
 
+            Write-Host "Exporting table $($table.Name) to $($curPath)"
+
             $outputCommand = '.output "{0}"' -f $curPath.Replace('\', '/')
 
             $quotedTable = Convert-SqlIdentifier($table.Name)
 
-            $output = & $sqlite $this.DatabasePath '.headers on' '.mode csv' $outputCommand "SELECT * FROM $quotedTable;" 2>&1
+            $output = & $sqlite $this.DatabasePath '.headers on' `
+                '.mode csv' $outputCommand "SELECT * FROM $quotedTable;" 2>&1
+
             $exitCode = $LASTEXITCODE  # save this immediately
 
             if ($exitCode -ne 0) {
@@ -293,7 +332,7 @@ class BlazorSiteManagement {
 
         $sqlite = (Get-Command sqlite3.exe -ErrorAction Stop).Source
 
-        $tableInfo = $this.GetTableInfo()
+        $tableInfo = GetTableInfo( $this )
 
         $staged = @()
 
@@ -326,6 +365,8 @@ class BlazorSiteManagement {
                     throw "Could not prepare staging table for $($item.Name)."
                 }
 
+                Write-Host "Importing $($curPath) into staging table"
+
                 # Import into a staging table; the CSV path is quoted for spaces.
                 $modCsvPath =  $curPath.Replace('\', '/')
                 $importCommand = '.import "{0}" {1}' -f $modCsvPath, $stageTable
@@ -341,10 +382,14 @@ class BlazorSiteManagement {
                 }
             }
 
+            Write-Host 'Preparing table updates'
+
             # Replace the destination tables together in one transaction.
             $sqlLines = @('BEGIN IMMEDIATE;')
 
             foreach ($item in $staged) {
+                Write-Host "Creating instructions to import staging table into $($item.Table)"
+
                 $target = Convert-SqlIdentifier($item.Table)
                 $stage = Convert-SqlIdentifier($item.Stage)
                 $columns = ($item.Columns | ForEach-Object { Convert-SqlIdentifier $_ }) -join ', '
@@ -354,8 +399,13 @@ class BlazorSiteManagement {
                 $sqlLines += "DROP TABLE $stage;"
             }
 
-            $sqlLines += 'UPDATE "Members" SET "LockoutEnd" = NULL;'
+            Write-Host "Adding update of LockoutEnd field to Null in $($site.IdentityTable)"
+
+            $identityTable = Convert-SqlIdentifier($site.IdentityTable)
+            $sqlLines += "UPDATE $identityTable SET `"LockoutEnd`" = NULL;"
             $sqlLines += 'COMMIT;'
+
+            Write-Host 'Executing table updates'
 
             $output = & $sqlite -echo -bail $this.DatabasePath ($sqlLines -join "`n") 2>&1
             $exitCode = $LASTEXITCODE  # save this immediately
@@ -384,6 +434,120 @@ class BlazorSiteManagement {
         }
     }
 
+    [void] InitRemoteAccess() {
+        $credential = Get-Credential -UserName 'root' -Message 'Enter passphrase for identity file'
+
+        $hostName = [ModuleConfig]::BlazorSitesInfo.HostName
+        $hostPort =[ModuleConfig]::BlazorSitesInfo.HostPort
+
+        Write-Host 'Starting SSH session'
+
+        $this.SshSession = New-SSHSession -ComputerName $hostName -Port $hostPort `
+            -Credential $credential `
+            -KeyFile "$env:USERPROFILE\.ssh\id_ed25519" -AcceptKey
+
+        $exitCode = $LASTEXITCODE
+
+        if ($exitCode -ne 0) {
+            throw "Establishing new SSH session failed with exit code $exitCode."
+        }
+
+        Write-Host 'Starting SFTP session'
+
+        $this.SftpSession = New-SFTPSession -ComputerName $hostName -Port $hostPort `
+            -Credential $credential `
+            -KeyFile "$env:USERPROFILE\.ssh\id_ed25519"  -AcceptKey
+
+        $exitCode = $LASTEXITCODE
+
+        if ($exitCode -ne 0) {
+            throw "Establishing new SFTP session failed with exit code $exitCode."
+        }
+    }
+
+    [void] EndRemoteAccess(){
+        if ($this.SftpSession) {
+            Write-Host 'Ending SFTP session'
+
+            Remove-SFTPSession -SessionId $this.SftpSession.SessionId
+            $this.SftpSession = $null
+        }
+    
+        if ($this.SshSession) {
+            Write-Host 'Ending SSH session'
+            
+            Remove-SSHSession -SessionId $this.SshSession.SessionId
+            $this.SshSession = $null
+        }
+    }
+    
+    [void] ExecuteSSHCommand([string]$command, [string] $mesg){
+        if( $null -eq $this.SshSession ){
+            $this.InitRemoteAccess()
+        }
+
+        $result = Invoke-SSHCommand -SessionId $this.SshSession.SessionId `
+            -Command $command
+
+        if( [string]::IsNullOrEmpty($mesg)) {
+            $mesg = "$command failed"
+        }
+
+        if ($result.ExitStatus -ne 0) {
+            throw "${mesg}: $($result.Error -join ' ')"
+        }
+    }
+
+    [void] PutWebsiteInMaintenanceMode(){
+        if( $null -eq $this.ProjectName ){
+            throw "ProjectName is not defined or empty"
+        }
+
+        $site = [ModuleConfig]::BlazorSitesInfo.SitesInfo | Where-Object { $_.Name -eq $this.ProjectName }
+
+        if( $null -eq $site ){
+            throw "Unknown project: $(this.ProjectName)"
+        }
+
+        Write-Host "Putting $site.ServiceName into maintenance mode"
+
+        $siteDir = [ModuleConfig]::BlazorSitesInfo.ApacheSiteDirectory.TrimEnd('/')
+
+        $cmd = "sudo sed -i.bak 's|^[[:space:]]*include $($siteDir)/$($site.Apache.OnlineFile)$|    include $($siteDir)/$($site.Apache.MaintenanceFile)|' $($siteDir)/$($site.Apache.ConfigFile)"
+        $this.ExecuteSSHCommand($cmd, 'Switch to maintenance mode failed')
+
+        Write-Host 'Shutting down site'
+        
+        $this.ExecuteSSHCommand("systemctl stop $($site.ServiceName)", 'Stopping service failed')
+
+        Write-Host 'Reloading apache'
+        
+        $this.ExecuteSSHCommand('systemctl reload apache2', 'Reloading apache2 failed')
+    }
+
+    [void] RestartWebsite(){
+        $site = [ModuleConfig]::BlazorSitesInfo.SitesInfo | Where-Object { $_.Name -eq $this.ProjectName }
+
+        if( $null -eq $site ){
+            throw "Unknown project: $(this.ProjectName)"
+        }
+
+        Write-Host "Restarting $site.ServiceName"
+
+        $this.ExecuteSSHCommand("systemctl restart $($site.ServiceName)", 'Stopping service failed')
+
+        Write-Host 'Taking site out of maintenance mode.'
+        
+        $siteDir = [ModuleConfig]::BlazorSitesInfo.ApacheSiteDirectory.TrimEnd('/')
+
+        $cmd = "sudo sed -i.bak 's|^[[:space:]]*include $($siteDir)/$($site.Apache.MaintenanceFile)$|    include $($siteDir)/$($site.Apache.OnlineFile)|' $($siteDir)/$($site.Apache.ConfigFile)"
+        $this.ExecuteSSHCommand($cmd, 'Failed to exit maintenance mode' )
+
+        Write-Host 'Reloading apache'
+        
+        $this.ExecuteSSHCommand('systemctl reload apache2', 'Reloading apache2 failed')
+    }
+
     [void] PublishToWebsite() {
         if( $null -eq $this.ProjectName ){
             throw "ProjectName is not defined or empty"
@@ -394,12 +558,16 @@ class BlazorSiteManagement {
             throw "Unknown project: $(this.ProjectName)"
         }
 
+        Write-Host 'Publishing development source code'
+
         dotnet publish -c Release -r linux-x64 --self-contained true -p:PublishSingleFile=true -o ./publish
         $publishExitCode = $LASTEXITCODE
 
         if ($publishExitCode -ne 0) {
             throw "dotnet publish failed with exit code $publishExitCode."
         }
+
+        Write-Host 'Identifying directories and files to update on the server'
 
         foreach( $pathInfo in $site.DirectoriesToUpdate ){
             $path = Join-Path $site.ProjectPath $pathInfo.ProjectRelativePath
@@ -417,19 +585,6 @@ class BlazorSiteManagement {
             }
         }
 
-        # Prompts for root's VPS password; it is not stored in the script.
-        # We use this weird workaround because VsCode Terminal does not
-        # reliably handle Ctrl-V pasted text. Thanx, Microsoft :( !
-        Write-Host "Copy the VPS root password to the clipboard, then return here." -ForegroundColor Yellow
-        $null = Read-Host "Press ENTER when the password is in the clipboard"
-
-        $plainPassword = (Get-Clipboard -Raw).Trim()
-        $securePassword = ConvertTo-SecureString $plainPassword -AsPlainText -Force
-        $credential = [pscredential]::new('root', $securePassword)
-
-        Remove-Variable plainPassword, securePassword
-        Set-Clipboard -Value ''
-
         $remoteRoot = $site.RemoteSiteDirectory.TrimEnd('/')
         $deletePaths = @()
 
@@ -445,76 +600,53 @@ class BlazorSiteManagement {
             $deletePaths += "$remoteRoot/$relative"
         }
 
-        $sshSession = $null
-        $sftpSession = $null
-        $hostName = [ModuleConfig]::BlazorSitesInfo.HostName
-        $hostPort =[ModuleConfig]::BlazorSitesInfo.HostPort
-
         try {
-            # -AcceptKey trusts a previously unseen server key. Verify the VPS host key
-            # fingerprint before the first run.
-            $sshSession = New-SSHSession -ComputerName $hostName -Port $hostPort -Credential $credential -AcceptKey
-
-            $sessionExitCode = $LASTEXITCODE
-
-            if ($sessionExitCode -ne 0) {
-                throw "Establishing new SSH session failed with exit code $sessionExitCode."
-            }
-
-            $sftpSession = New-SFTPSession -ComputerName $hostName -Port $hostPort -Credential $credential -AcceptKey
-
-            $ftpExitCode = $LASTEXITCODE
-
-            if ($ftpExitCode -ne 0) {
-                throw "Establishing new SFTP session failed with exit code $ftpExitCode."
-            }
+            $this.PutWebsiteInMaintenanceMode()
 
             $quotedPaths = ($DeletePaths | ForEach-Object {
                 Convert-ToQuotedPath( $_ )
             }) -join ' '
 
-            $result = Invoke-SSHCommand -SessionId $sshSession.SessionId -Command "rm -rf -- $quotedPaths"
+            Write-Host 'Removing files and directories to be replaced'
+            
+            $this.ExecuteSSHCommand("rm -rf -- $quotedPaths", 'Removing files and directories failed')
 
-            if ($result.ExitStatus -ne 0) {
-                throw "Remote deletion failed: $($result.Error -join ' ')"
-            }
+            Write-Host 'Uploading replacement files'
 
             foreach ($fileInfo in $site.FilesToUpdate) {
                 $localFilePath = Join-Path $this.ProjectPath $fileInfo.ProjectRelativePath
 
-                Set-SFTPItem -SessionId $sftpSession.SessionId -Path $localFilePath -Destination $site.RemoteSiteDirectory -Force
+                Set-SFTPItem -SessionId $this.SftpSession.SessionId -Path $localFilePath `
+                    -Destination $site.RemoteSiteDirectory -Force
             }
+
+            Write-Host 'Uploading replacement directories'
 
             foreach ($dirInfo in $site.DirectoriesToUpdate) {
                 $localDirPath = Join-Path $this.ProjectPath $dirInfo.ProjectRelativePath
 
-                Set-SFTPItem -SessionId $sftpSession.SessionId -Path $localDirPath -Destination $site.RemoteSiteDirectory -Force
+                Set-SFTPItem -SessionId $this.SftpSession.SessionId -Path $localDirPath `
+                    -Destination $site.RemoteSiteDirectory -Force
             }
 
-            $result = Invoke-SSHCommand -SessionId $sshSession.SessionId `
-                -Command "cd -- '$($site.RemoteSiteDirectory)' && chown -R www-data:www-data -- *"
+            Write-Host 'Updating file and directory ownership'
+            
+            $this.ExecuteSSHCommand("cd -- '$($site.RemoteSiteDirectory)' && chown -R www-data:www-data -- *", 'Updating ownership failed')
 
-            if ($result.ExitStatus -ne 0) {
-                throw "Could not chown files and directories: $($result.Error -join ' ')"
-            }
-
-            $result = Invoke-SSHCommand -SessionId $sshSession.SessionId `
-                -Command "cd -- '$($site.RemoteSiteDirectory)' && chmod u+x $($site.Name)"
-
-            if ($result.ExitStatus -ne 0) {
-                throw "Could not chmod $site.Name: $($result.Error -join ' ')"
-            }
+            Write-Host 'Making DLL executable'
+            
+            $this.ExecuteSSHCommand("cd -- '$($site.RemoteSiteDirectory)' && chmod u+x $($site.Name)", 'Changing executability failed')
 
             Write-Host 'Upload completed.'
+
+            $this.RestartWebsite()
+            
+            Write-Host 'Done'
         }
         finally {
-            if ($sftpSession) {
-                Remove-SFTPSession -SessionId $sftpSession.SessionId
-            }
-        
-            if ($sshSession) {
-                Remove-SSHSession -SessionId $sshSession.SessionId
-            }
+            $this.EndRemoteAccess()
         }    
     }
 }
+
+Export-ModuleMember -Function @()
